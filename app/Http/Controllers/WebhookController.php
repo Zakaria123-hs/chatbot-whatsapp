@@ -26,8 +26,8 @@ class WebhookController extends Controller
         
         // Safely extract text body depending on whether it's a pure text message or an extended text message
         $body = $request->input('messageData.textMessageData.textMessage') 
-             ?? $request->input('messageData.extendedTextMessageData.textMessage') 
-             ?? '';
+                ?? $request->input('messageData.extendedTextMessageData.textMessage') 
+                ?? '';
 
         // 2. Prevent Duplicates: If this exact message ID is already in our DB, stop immediately
         $duplicateCheck = Message::where('green_api_message_id', $messageId)->exists();
