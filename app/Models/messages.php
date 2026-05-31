@@ -19,8 +19,8 @@ class Message extends Model
     ];
 
     /**
-     * Get the contact that owns this message.
-     */
+        * Get the contact that owns this message.
+    */
     public function contact(): BelongsTo
     {
         return $table->belongsTo(Contact::class);
