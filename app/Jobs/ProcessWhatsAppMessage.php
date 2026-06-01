@@ -11,6 +11,7 @@ use Illuminate\Queue\InteractsWithQueue;
 use Illuminate\Queue\SerializesModels;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\DB;
 use Exception;
 
 class ProcessWhatsAppMessage implements ShouldQueue
@@ -32,22 +33,22 @@ class ProcessWhatsAppMessage implements ShouldQueue
      */
     public function handle(): void
     {
-        // 1. Find the incoming message in the database
-        $message = Message::find($this->messageId);
+        // 1. Find the incoming message in the database using DB::table
+        $message = DB::table('messages')->where('id', $this->messageId)->first();
 
         if (!$message || $message->status !== 'received') {
-            return; 
+            return;
         }
 
         // 2. Mark it as processing
-        $message->update(['status' => 'processing']);
+        DB::table('messages')->where('id', $this->messageId)->update(['status' => 'processing']);
 
         try {
             // 3. NO AI KEY NEEDED: Simply create a static echo reply text
             $echoReplyText = "Echo Bot: You said \"" . $message->body . "\"";
 
             // 4. Send that text back to your brother's phone via GREEN-API
-            $contact = $message->contact;
+            $contact = DB::table('contacts')->where('id', $message->contact_id)->first();
             
             $url = "https://api.green-api.com/waInstance" . env('GREEN_API_ID_INSTANCE') . "/sendMessage/" . env('GREEN_API_TOKEN_INSTANCE');
 
@@ -57,33 +58,39 @@ class ProcessWhatsAppMessage implements ShouldQueue
             ]);
 
             if ($greenApiResponse->failed()) {
+                \log::info('GREEN-API outgoing request failed: ' . $greenApiResponse->body());
+
                 throw new Exception('GREEN-API outgoing request failed: ' . $greenApiResponse->body());
             }
 
-            // 5. Store the Bot echo response in your messages table
-            Message::create([
+            // 5. Store the Bot echo response in your messages table using DB::table
+            DB::table('messages')->insert([
                 'contact_id'           => $contact->id,
                 'green_api_message_id' => $greenApiResponse->json('idMessage') ?? 'bot_' . uniqid(),
                 'sender_type'          => 'bot',
                 'message_type'         => 'textMessage',
                 'body'                 => $echoReplyText,
                 'status'               => 'completed',
-                'raw_payload'          => $greenApiResponse->json() ?? [],
+                'raw_payload'          => json_encode($greenApiResponse->json() ?? []),
                 'processed_at'         => now(),
+                'created_at'           => now(),
+                'updated_at'           => now(),
             ]);
 
             // 6. Update the original incoming message to completed
-            $message->update([
+            DB::table('messages')->where('id', $this->messageId)->update([
                 'status' => 'completed',
                 'processed_at' => now()
             ]);
 
-            $contact->update(['last_message_at' => now()]);
+            DB::table('contacts')->where('id', $contact->id)->update([
+                'last_message_at' => now()
+            ]);
 
         } catch (Exception $e) {
             Log::error('Redis Worker Error: ' . $e->getMessage());
             
-            $message->update([
+            DB::table('messages')->where('id', $this->messageId)->update([
                 'status' => 'failed',
                 'error_message' => $e->getMessage()
             ]);
