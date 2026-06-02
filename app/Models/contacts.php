@@ -10,14 +10,8 @@ class Contact extends Model
 {
     use HasFactory;
 
-    protected $fillable = [
-        'whatsapp_id',
-        'name',
-    ];
+    protected $fillable = ['whatsapp_id', 'profile_name', 'last_message_at'];
 
-    /**
-     * Get all messages for this contact.
-     */
     public function messages(): HasMany
     {
         return $this->hasMany(Message::class);

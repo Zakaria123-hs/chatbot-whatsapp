@@ -12,17 +12,30 @@ class Message extends Model
 
     protected $fillable = [
         'contact_id',
-        'green_api_message_id',
+        'meta_message_id',
         'sender_type',
+        'message_type',
         'body',
         'status',
+        'referral_source_url',
+        'raw_payload',
+        'error_message',
+        'processed_at',
     ];
 
     /**
-        * Get the contact that owns this message.
-    */
+     * Automatically cast the raw JSON payload to a PHP array
+     */
+    protected $casts = [
+        'raw_payload' => 'array',
+    ];
+
+    /**
+     * Get the contact that owns this message.
+     */
     public function contact(): BelongsTo
     {
-        return $table->belongsTo(Contact::class);
+        // Fixed: changed $table to $this
+        return $this->belongsTo(Contact::class);
     }
 }
