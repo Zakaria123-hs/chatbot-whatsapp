@@ -10,11 +10,8 @@ return new class extends Migration
     {
         Schema::create('contacts', function (Blueprint $table) {
             $table->id();
-            // The unique identifier from GREEN-API (e.g., '212600000000@c.us')
-            $table->string('whatsapp_id')->unique();
-            // The customer's WhatsApp profile name
-            $table->string('name')->nullable();
-            // Tracks when the last message was exchanged (useful for sorting chats)
+            $table->string('whatsapp_id')->unique(); // format: 2126XXXXXXXX
+            $table->string('profile_name')->nullable();
             $table->timestamp('last_message_at')->nullable();
             $table->timestamps();
         });
