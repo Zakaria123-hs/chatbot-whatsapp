@@ -15,5 +15,8 @@ Route::get('/test-queue', function () {
     return "Success! Check your queue:work terminal window now.";
 });
 
-// Manually defining the /api prefix inside web.php ignores all hidden API settings
-Route::post('/api/webhook/whatsapp', [WebhookController::class, 'receive']);
+use App\Http\Controllers\WhatsAppWebhookController;
+
+// Make sure these are the ONLY whatsapp webhook lines!
+Route::get('/api/webhook/whatsapp', [WhatsAppWebhookController::class, 'verify']);
+Route::post('/api/webhook/whatsapp', [WhatsAppWebhookController::class, 'receive']);
