@@ -11,7 +11,6 @@ use Illuminate\Queue\InteractsWithQueue;
 use Illuminate\Queue\SerializesModels;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
-use Illuminate\Support\Facades\DB;
 use Exception;
 
 class ProcessWhatsAppMessage implements ShouldQueue
@@ -33,65 +32,75 @@ class ProcessWhatsAppMessage implements ShouldQueue
      */
     public function handle(): void
     {
-        // 1. Find the incoming message in the database using DB::table
-        $message = DB::table('messages')->where('id', $this->messageId)->first();
+        // 1. Find the incoming message cleanly using Eloquent
+        $message = Message::find($this->messageId);
 
         if (!$message || $message->status !== 'received') {
             return;
         }
 
         // 2. Mark it as processing
-        DB::table('messages')->where('id', $this->messageId)->update(['status' => 'processing']);
+        $message->update(['status' => 'processing']);
 
         try {
-            // 3. NO AI KEY NEEDED: Simply create a static echo reply text
+            // 3. Create the echo response text
             $echoReplyText = "Echo Bot: You said \"" . $message->body . "\"";
 
-            // 4. Send that text back to your brother's phone via GREEN-API
-            $contact = DB::table('contacts')->where('id', $message->contact_id)->first();
+            // 4. Fetch the contact model relationship cleanly
+            $contact = $message->contact;
             
-            $url = "https://api.green-api.com/waInstance" . env('GREEN_API_ID_INSTANCE') . "/sendMessage/" . env('GREEN_API_TOKEN_INSTANCE');
+            // Meta Graph API Outbound Message URL setup
+            $phoneId = env('META_WHATSAPP_PHONE_NUMBER_ID');
+            $accessToken = env('META_WHATSAPP_ACCESS_TOKEN');
+            $url = "https://graph.facebook.com/v20.0/{$phoneId}/messages";
 
-            $greenApiResponse = Http::post($url, [
-                'chatId' => $contact->whatsapp_id,
-                'message' => $echoReplyText
+            // 5. Send payload to Meta Cloud API
+            $metaResponse = Http::withToken($accessToken)->post($url, [
+                'messaging_product' => 'whatsapp',
+                'recipient_type'    => 'individual',
+                'to'                => $contact->whatsapp_id,
+                'type'              => 'text',
+                'text'              => [
+                    'preview_url' => false,
+                    'body'        => $echoReplyText
+                ]
             ]);
 
-            if ($greenApiResponse->failed()) {
-                \log::info('GREEN-API outgoing request failed: ' . $greenApiResponse->body());
-
-                throw new Exception('GREEN-API outgoing request failed: ' . $greenApiResponse->body());
+            if ($metaResponse->failed()) {
+                throw new Exception('Meta Cloud API outbound request failed: ' . $metaResponse->body());
             }
 
-            // 5. Store the Bot echo response in your messages table using DB::table
-            DB::table('messages')->insert([
-                'contact_id'           => $contact->id,
-                'green_api_message_id' => $greenApiResponse->json('idMessage') ?? 'bot_' . uniqid(),
-                'sender_type'          => 'bot',
-                'message_type'         => 'textMessage',
-                'body'                 => $echoReplyText,
-                'status'               => 'completed',
-                'raw_payload'          => json_encode($greenApiResponse->json() ?? []),
-                'processed_at'         => now(),
-                'created_at'           => now(),
-                'updated_at'           => now(),
+            // Extract Meta's unique message ID for the bot's response
+            $metaResponseData = $metaResponse->json();
+            $botMetaMessageId = $metaResponseData['messages'][0]['id'] ?? 'bot_' . uniqid();
+
+            // 6. Store the Bot echo response in your messages table
+            Message::create([
+                'contact_id'          => $contact->id,
+                'meta_message_id'     => $botMetaMessageId, // Updated column name
+                'sender_type'         => 'bot',
+                'message_type'        => 'text',
+                'body'                => $echoReplyText,
+                'status'              => 'completed',
+                'raw_payload'         => $metaResponseData, // Handled beautifully as an array due to casts!
+                'processed_at'        => now(),
             ]);
 
-            // 6. Update the original incoming message to completed
-            DB::table('messages')->where('id', $this->messageId)->update([
-                'status' => 'completed',
+            // 7. Update the original incoming user message and contact timestamp to completed
+            $message->update([
+                'status'       => 'completed',
                 'processed_at' => now()
             ]);
 
-            DB::table('contacts')->where('id', $contact->id)->update([
+            $contact->update([
                 'last_message_at' => now()
             ]);
 
         } catch (Exception $e) {
-            Log::error('Redis Worker Error: ' . $e->getMessage());
+            Log::error('Meta Worker Queue Error: ' . $e->getMessage());
             
-            DB::table('messages')->where('id', $this->messageId)->update([
-                'status' => 'failed',
+            $message->update([
+                'status'        => 'failed',
                 'error_message' => $e->getMessage()
             ]);
         }
