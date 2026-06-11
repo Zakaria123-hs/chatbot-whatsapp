@@ -32,17 +32,16 @@ class ProcessWhatsAppMessage implements ShouldQueue
         }
 
         try {
-            // 1. Cleaner, lightweight system prompt (NO product data here!)
             $systemPrompt = "You are 'Zaka Battery Assistant', an expert AI concierge for an e-commerce website specializing in high-quality batteries (cars, motorcycles, solar, etc.).
             
 YOUR CORE RULES:
 - Respond in the EXACT language or dialect the customer uses (Moroccan Darija, Arabic, French, English).
-- If the customer asks about a specific battery, wants a price, or checks availability, you MUST call the 'search_battery_database' tool to look up real-time information. Do not guess or make up details.
-- Always present the data cleanly using WhatsApp markdown formatting (*bold* keys, list bullet points, clear spacing) and natural emojis.";
+- If the customer asks for a battery, a specific brand, checks a price, or asks for a range of prices (e.g., between 300 and 500 DH), you MUST use the 'search_battery_database' tool. Do not guess the stock or pricing.
+- Present data cleanly using WhatsApp markdown (*bold* keys, bullet points) and friendly emojis.";
 
             $apiMessages = [['role' => 'system', 'content' => $systemPrompt]];
 
-            // 2. Fetch lightweight recent conversation history
+            // Fetch recent conversation history
             $history = Message::where('contact_id', $message->contact_id)
                 ->where('id', '<', $this->messageId)
                 ->orderBy('id', 'desc')
@@ -57,31 +56,42 @@ YOUR CORE RULES:
                 ];
             }
 
-            // Append current user message
+            // Append current message
             $apiMessages[] = ['role' => 'user', 'content' => $message->body];
 
-            // 3. Define the Tool blueprint for Groq
+            // 1. Expanded Tool Blueprint with Price Filters
             $tools = [
                 [
                     'type' => 'function',
                     'function' => [
                         'name' => 'search_battery_database',
-                        'description' => 'Searches the local database for batteries matching a specific search term or brand name provided by the customer.',
+                        'description' => 'Searches the local database for batteries by keyword, brand, exact price, or minimum/maximum price ranges.',
                         'parameters' => [
                             'type' => 'object',
                             'properties' => [
                                 'search_term' => [
                                     'type' => 'string',
-                                    'description' => 'The brand name or model of the battery extracted from the user text (e.g., Bosch, Varta, YTX9, Solar).'
+                                    'description' => 'The brand name or model keyword extracted from user text (e.g., Bosch, Varta, motorcycle, car). Pass an empty string if they only ask for a price range.'
+                                ],
+                                'exact_price' => [
+                                    'type' => 'number',
+                                    'description' => 'An exact price if the user explicitly asks for something costing a fixed amount (e.g., 800).'
+                                ],
+                                'min_price' => [
+                                    'type' => 'number',
+                                    'description' => 'The lower bound of a price range if provided by the customer (e.g., 300).'
+                                ],
+                                'max_price' => [
+                                    'type' => 'number',
+                                    'description' => 'The upper bound of a price range if provided by the customer (e.g., 500).'
                                 ]
-                            ],
-                            'required' => ['search_term']
+                            ]
                         ]
                     ]
                 ]
             ];
 
-            // 4. First call to Groq: Let the AI decide if it needs a tool
+            // First call to Groq
             $response = Http::withHeaders([
                 'Authorization' => 'Bearer ' . env('GROQ_API_KEY'),
                 'Content-Type' => 'application/json',
@@ -90,7 +100,7 @@ YOUR CORE RULES:
                 'messages' => $apiMessages,
                 'tools' => $tools,
                 'tool_choice' => 'auto',
-                'temperature' => 0.3,
+                'temperature' => 0.2,
             ]);
 
             if ($response->failed()) {
@@ -101,39 +111,59 @@ YOUR CORE RULES:
             $responseData = $response->json();
             $responseMessage = $responseData['choices'][0]['message'] ?? null;
 
-            // 5. Check if Groq decided to execute the tool
+            // 2. Process the Tool Call with dynamic Eloquent query logic
             if (!empty($responseMessage['tool_calls'])) {
                 foreach ($responseMessage['tool_calls'] as $toolCall) {
                     if ($toolCall['function']['name'] === 'search_battery_database') {
-                        // Extract arguments determined by the AI
                         $arguments = json_decode($toolCall['function']['arguments'], true);
-                        $searchTerm = $arguments['search_term'] ?? '';
+                        
+                        $searchTerm = $arguments['search_term'] ?? null;
+                        $exactPrice = $arguments['exact_price'] ?? null;
+                        $minPrice = $arguments['min_price'] ?? null;
+                        $maxPrice = $arguments['max_price'] ?? null;
 
-                        // Run your fast native Laravel Eloquent Query!
-                        $products = Product::where('status', 'active')
-                            ->where('name', 'LIKE', '%' . $searchTerm . '%')
-                            ->get();
+                        // Start building the query dynamically
+                        $query = Product::where('status', 'active');
 
-                        // Format what we found into a string for the AI
+                        // Filter by text keyword if present
+                        if (!empty($searchTerm)) {
+                            $query->where('name', 'LIKE', '%' . $searchTerm . '%');
+                        }
+
+                        // Filter by exact price if present
+                        if (!property_exists((object)$arguments, 'exact_price') && !is_null($exactPrice)) {
+                            $query->where('price', '=', $exactPrice);
+                        }
+
+                        // Filter by price ranges if present
+                        if (!is_null($minPrice)) {
+                            $query->where('price', '>=', $minPrice);
+                        }
+                        if (!is_null($maxPrice)) {
+                            $query->where('price', '<=', $maxPrice);
+                        }
+
+                        $products = $query->get();
+
+                        // Format results string back to the AI
                         $dbResultString = "";
                         if ($products->isEmpty()) {
-                            $dbResultString = "No matching active products found for keyword: " . $searchTerm;
+                            $dbResultString = "No matching active products found with your criteria.";
                         } else {
                             foreach ($products as $prod) {
-                                $dbResultString .= "- *{$prod->name}* | Retail Price: {$prod->price} DH | Discounted: " . ($prod->is_discountable ? "Yes ({$prod->discount_percentage}%)" : "No") . " | *Final Price: {$prod->final_price} DH* | Stock Level: " . ($prod->stock_quantity > 0 ? "{$prod->stock_quantity} units available" : "OUT OF STOCK") . "\n";
+                                $dbResultString .= "- *{$prod->name}* | Original: {$prod->price} DH | Discounted: " . ($prod->is_discountable ? "Yes ({$prod->discount_percentage}%)" : "No") . " | *Final Price: {$prod->final_price} DH* | Stock: " . ($prod->stock_quantity > 0 ? "{$prod->stock_quantity} units" : "OUT OF STOCK") . "\n";
                             }
                         }
 
-                        // Append the AI's intent and the tool results back into the conversation context array
-                        $apiMessages[] = $responseMessage; // Add the tool call request
+                        $apiMessages[] = $responseMessage; 
                         $apiMessages[] = [
                             'role' => 'tool',
                             'tool_call_id' => $toolCall['id'],
                             'name' => 'search_battery_database',
-                            'content' => $dbResultString // Send the actual database results back to the AI
+                            'content' => $dbResultString
                         ];
 
-                        // 6. Second call to Groq: Let the AI generate a native human-like response using the query data
+                        // Second call to Groq for the human-like text reply
                         $secondResponse = Http::withHeaders([
                             'Authorization' => 'Bearer ' . env('GROQ_API_KEY'),
                             'Content-Type' => 'application/json',
@@ -152,14 +182,13 @@ YOUR CORE RULES:
                 }
             }
 
-            // If the user just said "Hi" or something basic, no tool call is triggered. Send the standard text back.
             $fallbackText = $responseMessage['content'] ?? '';
             if (!empty($fallbackText)) {
                 $this->sendWhatsAppMessage($message->contact->whatsapp_id, $fallbackText, $message->contact_id);
             }
 
         } catch (\Exception $e) {
-            Log::error('Tool AI Execution Failed: ' . $e->getMessage() . ' on line ' . $e->getLine());
+            Log::error('Tool AI Price Filter Failed: ' . $e->getMessage() . ' on line ' . $e->getLine());
         }
     }
 
@@ -189,7 +218,7 @@ YOUR CORE RULES:
                 'raw_payload' => $metaData,
             ]);
         } else {
-            Log::error('Meta Tool Response Outbound Failed: ' . $response->body());
+            Log::error('Meta Outbound Send Failed: ' . $response->body());
         }
     }
 }
