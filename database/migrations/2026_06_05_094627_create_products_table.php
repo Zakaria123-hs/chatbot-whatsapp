@@ -14,25 +14,21 @@ return new class extends Migration
         Schema::create('products', function (Blueprint $table) {
             $table->id();
             
-            // Core Product Information
-            $table->string('name');
-            // Pricing & Discount Logic
-            $table->decimal('price', 10, 2); // Standard retail price (e.g., 99999999.99 max)
+            // Core Product Data
+            $table->string('name'); // Full visible name (e.g., "Varta Silver Dynamic E44")
+            $table->string('brand'); // Explicitly for filtering (e.g., "Varta", "Bosch")
+            $table->integer('amperage')->nullable(); // Battery Capacity in Ah (e.g., 74, 60, 100)
+            $table->string('application_type'); // Category (e.g., "car", "motorcycle", "solar")
             
-            // Your Discountable logic split into two highly helpful columns:
-            $table->boolean('is_discountable')->default(true); // Flag to explicitly enable/disable discount rules for this product
-            $table->unsignedTinyInteger('discount_percentage')->default(0); // The percentage value (0 to 100) that can be reduced
-
-            // Inventory & Management
+            // Pricing & Stock
+            $table->decimal('price', 10, 2);
+            $table->boolean('is_discountable')->default(true);
+            $table->unsignedTinyInteger('discount_percentage')->default(0);
             $table->integer('stock_quantity')->default(0);
-            $table->integer('low_stock_threshold')->default(5); // Alert threshold when stock runs thin
-            
-            // Status Flags
             $table->enum('status', ['draft', 'active', 'out_of_stock', 'archived'])->default('active');
             
-            // Timestamps
-            $table->timestamps(); // creates created_at and updated_at
-            $table->softDeletes(); // optional: allows deleting a product without erasing it instantly from sales history
+            $table->timestamps();
+            $table->softDeletes();
         });
     }
 
