@@ -68,36 +68,42 @@ class ProcessWhatsAppMessage implements ShouldQueue
 
             // 1. Expanded Tool Blueprint with Price Filters
             $tools = [
-                        [
-                            'type' => 'function',
-                            'function' => [
-                                'name' => 'search_battery_database',
-                                'description' => 'Searches the database for batteries. Do NOT invent new parameters like brand. Put all brand names, capacities, or keywords inside the search_term parameter.',
-                                'parameters' => [
-                                    'type' => 'object',
-                                    'properties' => [
-                                        'search_term' => [
-                                            'type' => 'string',
-                                            'description' => 'The search keyword, brand name, or capacity model (e.g., Bosch, Varta, 74Ah, car). Leave null or empty string ONLY if the user is only asking for a price range.'
-                                        ],
-                                        'exact_price' => [
-                                            'type' => 'number',
-                                            'description' => 'Match an exact price if mentioned. DO NOT provide or set to 0 unless the user literally requested something for 0 DH.'
-                                        ],
-                                        'min_price' => [
-                                            'type' => 'number',
-                                            'description' => 'The minimum price boundary. Do NOT set to 0 unless explicitly requested.'
-                                        ],
-                                        'max_price' => [
-                                            'type' => 'number',
-                                            'description' => 'The maximum price boundary.'
-                                        ]
+                    [
+                        'type' => 'function',
+                        'function' => [
+                            'name' => 'search_battery_database',
+                            'description' => 'Queries the warehouse database for available active batteries matching specific filters. Only call this when the customer is looking for a battery. Always filter by application_type if determinable from context.',
+                            'parameters' => [
+                                'type' => 'object',
+                                'properties' => [
+                                    'brand' => [
+                                        'type' => 'string', // Fixed: Single type string. Groq will omit if missing.
+                                        'description' => 'Brand manufacturer name (e.g. "Bosch", "Varta").'
                                     ],
-                                    // We don't make anything strictly required so it can be fully dynamic
-                                ]
+                                    'amperage' => [
+                                        'type' => 'integer', // Fixed: Single type integer.
+                                        'description' => 'Battery capacity in Ah as integer (e.g. 74, 100, 60).'
+                                    ],
+                                    'application_type' => [
+                                        'type' => 'string',
+                                        'enum' => ['car', 'motorcycle', 'solar', 'truck'],
+                                        'description' => 'Vehicle or usage type. Infer from context if not explicitly stated (e.g., "tombil" implies car, "motor" implies motorcycle).'
+                                    ],
+                                    'min_price' => [
+                                        'type' => 'number',
+                                        'description' => 'Minimum price filter in local currency (DH).'
+                                    ],
+                                    'max_price' => [
+                                        'type' => 'number',
+                                        'description' => 'Maximum price filter in local currency (DH).'
+                                    ],
+                                ],
+                                'required' => ['application_type'], // Brilliantly forces diagnostic behavior first!
+                                'additionalProperties' => false
                             ]
                         ]
-                    ];
+                    ]
+                ];
             // First call to Groq
             $response = Http::withHeaders([
                 'Authorization' => 'Bearer ' . env('GROQ_API_KEY'),
@@ -119,51 +125,43 @@ class ProcessWhatsAppMessage implements ShouldQueue
             $responseMessage = $responseData['choices'][0]['message'] ?? null;
 
             // 2. Process the Tool Call with dynamic Eloquent query logic
-           if (!empty($responseMessage['tool_calls'])) {
+            if (!empty($responseMessage['tool_calls'])) {
                 foreach ($responseMessage['tool_calls'] as $toolCall) {
                     if ($toolCall['function']['name'] === 'search_battery_database') {
                         $arguments = json_decode($toolCall['function']['arguments'], true);
                         
-                        // Extract parameters, safely defaulting to null instead of 0
-                        $searchTerm = $arguments['search_term'] ?? null;
-                        
-                        // Crucial fix: If the AI sets values to 0 or empty strings, treat them as null
-                        $exactPrice = (!empty($arguments['exact_price'])) ? $arguments['exact_price'] : null;
-                        $minPrice = (!empty($arguments['min_price'])) ? $arguments['min_price'] : null;
-                        $maxPrice = (!empty($arguments['max_price'])) ? $arguments['max_price'] : null;
-
-                        // Check if the AI accidentally put the brand into a hallucinated 'brand' key
-                        if (empty($searchTerm) && !empty($arguments['brand'])) {
-                            $searchTerm = $arguments['brand'];
-                        }
-
-                        // Start building the query dynamically
+                        // Build the query instantly off real columns
                         $query = Product::where('status', 'active');
 
-                        if (!empty($searchTerm)) {
-                            $query->where('name', 'LIKE', '%' . $searchTerm . '%');
+                        if (!empty($arguments['brand'])) {
+                            $query->where('brand', 'LIKE', '%' . $arguments['brand'] . '%');
                         }
 
-                        if (!is_null($exactPrice)) {
-                            $query->where('price', '=', $exactPrice);
+                        if (!empty($arguments['amperage'])) {
+                            $query->where('amperage', '=', $arguments['amperage']);
                         }
 
-                        if (!is_null($minPrice)) {
-                            $query->where('price', '>=', $minPrice);
+                        if (!empty($arguments['application_type'])) {
+                            $query->where('application_type', '=', $arguments['application_type']);
                         }
-                        if (!is_null($maxPrice)) {
-                            $query->where('price', '<=', $maxPrice);
+
+                        if (!empty($arguments['min_price'])) {
+                            $query->where('price', '>=', $arguments['min_price']);
+                        }
+
+                        if (!empty($arguments['max_price'])) {
+                            $query->where('price', '<=', $arguments['max_price']);
                         }
 
                         $products = $query->get();
 
-                        // Format results string back to the AI
+                        // Format results for the AI
                         $dbResultString = "";
                         if ($products->isEmpty()) {
-                            $dbResultString = "No matching active products found for your criteria.";
+                            $dbResultString = "No matching batteries found in the warehouse right now.";
                         } else {
                             foreach ($products as $prod) {
-                                $dbResultString .= "- *{$prod->name}* | Original: {$prod->price} DH | *Final Price: {$prod->final_price} DH* | Stock: " . ($prod->stock_quantity > 0 ? "{$prod->stock_quantity} units" : "OUT OF STOCK") . "\n";
+                                $dbResultString .= "- *{$prod->name}* ({$prod->brand}) | Spec: {$prod->amperage}Ah | Price: {$prod->final_price} DH | Stock: {$prod->stock_quantity}\n";
                             }
                         }
 
