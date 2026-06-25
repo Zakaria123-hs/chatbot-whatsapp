@@ -16,218 +16,371 @@ class ProcessWhatsAppMessage implements ShouldQueue
 {
     use Dispatchable, InteractsWithQueue, Queueable, SerializesModels;
 
-    protected $messageId;
+    protected int $messageId;
 
-    public function __construct($messageId)
+    // Retry the job up to 2 times if it throws an exception
+    public int $tries = 2;
+
+    // Wait 10 seconds before retrying
+    public int $backoff = 10;
+
+    public function __construct(int $messageId)
     {
         $this->messageId = $messageId;
     }
 
-    public function handle()
+    public function handle(): void
     {
+        // ── 1. Load message ───────────────────────────────────────────────────
         $message = Message::with('contact')->find($this->messageId);
 
         if (!$message || $message->sender_type !== 'user') {
             return;
         }
 
-        try {
-            $systemPrompt = "You are 'Zaka Battery Assistant', an expert human-like consultant for a battery e-commerce store in Morocco. Many customers do not know technical battery details, so your job is to guide them conversationally to find the perfect product.
-                YOUR GOAL:
-                Before you call the 'search_battery_database' tool, you should ideally know:
-                1. Vehicle/Application Type (Car, Motorcycle, Truck, or Solar system).
-                2. Battery Capacity in Amperes (Ah) (e.g., 60Ah, 74Ah, 100Ah).
-                3. Preferred Brand (Bosch, Varta, Yuasa, etc. - Optional, only if they care).
+        // ── 2. System Prompt ──────────────────────────────────────────────────
+        $systemPrompt = "
+You are 'Zaka', a friendly battery sales consultant for a Moroccan battery e-commerce store.
+You communicate like a real Moroccan salesperson — warm, short, and natural.
 
-                DIAGNOSTIC CONVERSATION RULES:
-                - Read the user's message and check the chat history. Mark down which info slots are already known.
-                - DO NOT ask all questions at once. Ask ONE clear, friendly question at a time to get the missing information.
-                - Match the customer's dialect naturally (Moroccan Darija 🇲🇦, Arabic, French, or English). Keep your phrasing warm, helpful, and local.
-                - If the customer provides partial information (e.g., 'I want a Bosch battery'), check your history, recognize that Amperes/Ah is missing, and politely ask them: 'Wakha sidi, chhal mn Ah (Ampère) fiha wla ina tombil 3ndk?' (Sure, how many Ah or what car do you have?).
-                - Once you have gathered enough parameters to make a useful search, trigger the 'search_battery_database' tool immediately to show them real matching options with their stock and dynamic final prices.";
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+YOUR GOAL
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Collect enough info to call search_battery_database, then show the customer real matching products.
 
-            $apiMessages = [['role' => 'system', 'content' => $systemPrompt]];
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+INFO YOU NEED (in order of priority)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+1. APPLICATION TYPE (REQUIRED) — Car, Motorcycle, Truck, or Solar.
+   Darija hints: 'tombil/tyara' = car, 'moto' = motorcycle, 'camion/kamyu' = truck
+2. AMPERAGE (REQUIRED before search) — Accept ANY of these:
+   - Exact: '74Ah', '60 ampir'
+   - Range: 'bin 60 o 80' → use min_amperage=60, max_amperage=80
+   - Car model: 'Dacia Logan', 'Clio' → you know typical range, ASK to confirm or proceed
+3. BRAND (OPTIONAL) — Only ask if not mentioned and not resolved.
+   If customer says 'any brand', 'marka ma3ndich', 'machi muhim' → brand is RESOLVED, never ask again.
 
-            // Fetch recent conversation history
-            $history = Message::where('contact_id', $message->contact_id)
-                ->where('id', '<', $this->messageId)
-                ->orderBy('id', 'desc')
-                ->limit(6)
-                ->get()
-                ->reverse();
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+CRITICAL RULES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+- NEVER ask more than ONE question per message.
+- NEVER ask the same question twice. Read the full conversation history first.
+- If application_type AND amperage (exact or range) are both known → call search_battery_database IMMEDIATELY. Do not ask more questions.
+- If customer gives a range like 'between 60 and 80Ah' → that is SUFFICIENT. Search now.
+- If customer mentions a car model → treat application_type as 'car' and ask only for Ah if missing.
+- Brand is OPTIONAL. If unknown after 2 exchanges, search without it.
+- NEVER reveal tool names, JSON, function calls, or any technical internals to the customer. You are a human salesperson.
+- NEVER send messages like 'search_battery_database {..}'. That is a critical error.
+- After showing results, ask if they want to order or need more help.
 
-            foreach ($history as $pastMessage) {
-                $apiMessages[] = [
-                    'role' => $pastMessage->sender_type === 'user' ? 'user' : 'assistant',
-                    'content' => $pastMessage->body
-                ];
-            }
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+CONVERSATION STYLE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+- Match the customer's language (Darija, Arabic, French, English).
+- Keep replies SHORT. Max 3 lines unless showing product results.
+- Use 'sidi/lala' naturally. Be warm, not robotic.
+- When showing products, format them clearly with name, Ah, and price.
+";
 
-            // Append current message
-            $apiMessages[] = ['role' => 'user', 'content' => $message->body];
+        // ── 3. Build conversation history ─────────────────────────────────────
+        $apiMessages = [['role' => 'system', 'content' => $systemPrompt]];
 
-            // 1. Expanded Tool Blueprint with Price Filters
-            $tools = [
-                    [
-                        'type' => 'function',
-                        'function' => [
-                            'name' => 'search_battery_database',
-                            'description' => 'Queries the warehouse database for available active batteries matching specific filters. Only call this when the customer is looking for a battery. Always filter by application_type if determinable from context.',
-                            'parameters' => [
-                                'type' => 'object',
-                                'properties' => [
-                                    'brand' => [
-                                        'type' => 'string', // Fixed: Single type string. Groq will omit if missing.
-                                        'description' => 'Brand manufacturer name (e.g. "Bosch", "Varta").'
-                                    ],
-                                    'amperage' => [
-                                        'type' => 'integer', // Fixed: Single type integer.
-                                        'description' => 'Battery capacity in Ah as integer (e.g. 74, 100, 60).'
-                                    ],
-                                    'application_type' => [
-                                        'type' => 'string',
-                                        'enum' => ['car', 'motorcycle', 'solar', 'truck'],
-                                        'description' => 'Vehicle or usage type. Infer from context if not explicitly stated (e.g., "tombil" implies car, "motor" implies motorcycle).'
-                                    ],
-                                    'min_price' => [
-                                        'type' => 'number',
-                                        'description' => 'Minimum price filter in local currency (DH).'
-                                    ],
-                                    'max_price' => [
-                                        'type' => 'number',
-                                        'description' => 'Maximum price filter in local currency (DH).'
-                                    ],
-                                ],
-                                'required' => ['application_type'], // Brilliantly forces diagnostic behavior first!
-                                'additionalProperties' => false
-                            ]
-                        ]
-                    ]
-                ];
-            // First call to Groq
-            $response = Http::withHeaders([
-                'Authorization' => 'Bearer ' . env('GROQ_API_KEY'),
-                'Content-Type' => 'application/json',
-            ])->post('https://api.groq.com/openai/v1/chat/completions', [
-                'model' => 'llama-3.1-8b-instant',
-                'messages' => $apiMessages,
-                'tools' => $tools,
-                'tool_choice' => 'auto',
-                'temperature' => 0.2,
-            ]);
+        $history = Message::where('contact_id', $message->contact_id)
+            ->where('id', '<', $this->messageId)
+            ->orderBy('id', 'desc')
+            ->limit(10) // last 10 messages for better context
+            ->get()
+            ->reverse();
 
-            if ($response->failed()) {
-                Log::error('Groq Initial Call Error: ' . $response->body());
-                return;
-            }
+        foreach ($history as $past) {
+            // Skip empty bot messages or raw payload leaks
+            if (empty(trim($past->body))) continue;
 
-            $responseData = $response->json();
-            $responseMessage = $responseData['choices'][0]['message'] ?? null;
+            $apiMessages[] = [
+                'role'    => $past->sender_type === 'user' ? 'user' : 'assistant',
+                'content' => $past->body,
+            ];
+        }
 
-            // 2. Process the Tool Call with dynamic Eloquent query logic
-            if (!empty($responseMessage['tool_calls'])) {
-                foreach ($responseMessage['tool_calls'] as $toolCall) {
-                    if ($toolCall['function']['name'] === 'search_battery_database') {
-                        $arguments = json_decode($toolCall['function']['arguments'], true);
-                        
-                        // Build the query instantly off real columns
-                        $query = Product::where('status', 'active');
+        // Append current user message
+        $apiMessages[] = ['role' => 'user', 'content' => $message->body];
 
-                        if (!empty($arguments['brand'])) {
-                            $query->where('brand', 'LIKE', '%' . $arguments['brand'] . '%');
-                        }
+        // ── 4. Tool Definition ────────────────────────────────────────────────
+        $tools = [
+            [
+                'type' => 'function',
+                'function' => [
+                    'name'        => 'search_battery_database',
+                    'description' => 'Search the warehouse for active batteries. Call this as soon as you have application_type and any amperage information (exact or range). Do not wait for brand if customer did not specify one.',
+                    'parameters'  => [
+                        'type'       => 'object',
+                        'properties' => [
+                            'application_type' => [
+                                'type'        => 'string',
+                                'enum'        => ['car', 'motorcycle', 'solar', 'truck'],
+                                'description' => 'Vehicle or usage type. Infer from context: tombil=car, moto=motorcycle, camion=truck.',
+                            ],
+                            'amperage' => [
+                                'type'        => 'integer',
+                                'description' => 'Exact battery capacity in Ah (e.g. 60, 74, 100). Use this for exact searches. If customer gave a range, use min_amperage and max_amperage instead.',
+                            ],
+                            'min_amperage' => [
+                                'type'        => 'integer',
+                                'description' => 'Minimum Ah when customer gives a range (e.g. 60 if they said between 60 and 80).',
+                            ],
+                            'max_amperage' => [
+                                'type'        => 'integer',
+                                'description' => 'Maximum Ah when customer gives a range (e.g. 80 if they said between 60 and 80).',
+                            ],
+                            'brand' => [
+                                'type'        => 'string',
+                                'description' => 'Brand name if specified (e.g. Bosch, Varta, Yuasa). Omit if customer said any brand or did not mention one.',
+                            ],
+                            'min_price' => [
+                                'type'        => 'number',
+                                'description' => 'Minimum price in DH. Omit if no budget mentioned.',
+                            ],
+                            'max_price' => [
+                                'type'        => 'number',
+                                'description' => 'Maximum price in DH. Omit if no budget mentioned.',
+                            ],
+                        ],
+                        'required' => ['application_type'],
+                        // No additionalProperties:false — lets Groq omit optional fields cleanly
+                    ],
+                ],
+            ],
+        ];
 
-                        if (!empty($arguments['amperage'])) {
-                            $query->where('amperage', '=', $arguments['amperage']);
-                        }
+        // ── 5. First Groq Call ────────────────────────────────────────────────
+        $firstResponse = $this->callGroq([
+            'model'       => 'llama-3.3-70b-versatile', // better reasoning than 8b-instant
+            'messages'    => $apiMessages,
+            'tools'       => $tools,
+            'tool_choice' => 'auto',
+            'temperature' => 0.2,
+        ]);
 
-                        if (!empty($arguments['application_type'])) {
-                            $query->where('application_type', '=', $arguments['application_type']);
-                        }
+        if (!$firstResponse) {
+            $this->sendFallback($message);
+            return;
+        }
 
-                        if (!empty($arguments['min_price'])) {
-                            $query->where('price', '>=', $arguments['min_price']);
-                        }
+        $responseMessage = $firstResponse['choices'][0]['message'] ?? null;
 
-                        if (!empty($arguments['max_price'])) {
-                            $query->where('price', '<=', $arguments['max_price']);
-                        }
+        if (!$responseMessage) {
+            $this->sendFallback($message);
+            return;
+        }
 
-                        $products = $query->get();
+        // ── 6. Handle Tool Call ───────────────────────────────────────────────
+        if (!empty($responseMessage['tool_calls'])) {
 
-                        // Format results for the AI
-                        $dbResultString = "";
-                        if ($products->isEmpty()) {
-                            $dbResultString = "No matching batteries found in the warehouse right now.";
-                        } else {
-                            foreach ($products as $prod) {
-                                $dbResultString .= "- *{$prod->name}* ({$prod->brand}) | Spec: {$prod->amperage}Ah | Price: {$prod->final_price} DH | Stock: {$prod->stock_quantity}\n";
-                            }
-                        }
+            foreach ($responseMessage['tool_calls'] as $toolCall) {
 
-                        $apiMessages[] = $responseMessage; 
-                        $apiMessages[] = [
-                            'role' => 'tool',
-                            'tool_call_id' => $toolCall['id'],
-                            'name' => 'search_battery_database',
-                            'content' => $dbResultString
-                        ];
+                if ($toolCall['function']['name'] !== 'search_battery_database') continue;
 
-                        // Second call to Groq for the human-like text reply
-                        $secondResponse = Http::withHeaders([
-                            'Authorization' => 'Bearer ' . env('GROQ_API_KEY'),
-                            'Content-Type' => 'application/json',
-                        ])->post('https://api.groq.com/openai/v1/chat/completions', [
-                            'model' => 'llama-3.1-8b-instant',
-                            'messages' => $apiMessages,
-                            'temperature' => 0.5,
-                        ]);
+                $arguments = json_decode($toolCall['function']['arguments'], true);
 
-                        if ($secondResponse->successful()) {
-                            $finalText = $secondResponse->json('choices.0.message.content');
-                            $this->sendWhatsAppMessage($message->contact->whatsapp_id, $finalText, $message->contact_id);
-                        }
-                        return;
+                if (json_last_error() !== JSON_ERROR_NONE) {
+                    Log::error('Groq tool arguments JSON decode failed', ['raw' => $toolCall['function']['arguments']]);
+                    $this->sendFallback($message);
+                    return;
+                }
+
+                // ── 6a. Build DB Query ────────────────────────────────────────
+                $query = Product::query()
+                    ->where('status', 'active')
+                    ->where('stock_quantity', '>', 0); // never show out of stock
+
+                if (!empty($arguments['application_type'])) {
+                    $query->where('application_type', $arguments['application_type']);
+                }
+
+                // Amperage: range takes priority over exact
+                if (!empty($arguments['min_amperage']) && !empty($arguments['max_amperage'])) {
+                    $query->whereBetween('amperage', [$arguments['min_amperage'], $arguments['max_amperage']]);
+                } elseif (!empty($arguments['amperage'])) {
+                    // ±10Ah tolerance for exact searches (catches 60Ah when user says "around 60")
+                    $query->whereBetween('amperage', [
+                        $arguments['amperage'] - 10,
+                        $arguments['amperage'] + 10,
+                    ]);
+                }
+
+                if (!empty($arguments['brand'])) {
+                    $query->where('brand', 'LIKE', '%' . $arguments['brand'] . '%');
+                }
+
+                if (!empty($arguments['min_price'])) {
+                    $query->where('price', '>=', $arguments['min_price']);
+                }
+
+                if (!empty($arguments['max_price'])) {
+                    $query->where('price', '<=', $arguments['max_price']);
+                }
+
+                $products = $query
+                    ->select(['name', 'brand', 'amperage', 'application_type', 'price', 'discount_percentage', 'stock_quantity'])
+                    ->orderBy('price')
+                    ->limit(5) // never dump full catalog into the prompt
+                    ->get();
+
+                // ── 6b. Format DB results for AI ──────────────────────────────
+                if ($products->isEmpty()) {
+                    $dbResult = "No matching batteries found in the warehouse right now. Inform the customer politely and ask if they want to adjust their search.";
+                } else {
+                    $dbResult = "Found " . $products->count() . " matching batteries:\n\n";
+                    foreach ($products as $prod) {
+                        $dbResult .= "- {$prod->name} ({$prod->brand}) | {$prod->amperage}Ah | Price: {$prod->final_price} DH | Stock: {$prod->stock_quantity} units\n";
                     }
                 }
-            }
-            $fallbackText = $responseMessage['content'] ?? '';
-            if (!empty($fallbackText)) {
-                $this->sendWhatsAppMessage($message->contact->whatsapp_id, $fallbackText, $message->contact_id);
-            }
 
-        } catch (\Exception $e) {
-            Log::error('Tool AI Price Filter Failed: ' . $e->getMessage() . ' on line ' . $e->getLine());
+                // ── 6c. Build messages for second call ────────────────────────
+                $apiMessages[] = $responseMessage; // assistant turn with tool_calls
+                $apiMessages[] = [
+                    'role'         => 'tool',
+                    'tool_call_id' => $toolCall['id'],
+                    'name'         => 'search_battery_database',
+                    'content'      => $dbResult,
+                ];
+
+                // ── 6d. Second Groq Call — generate human reply ───────────────
+                $secondResponse = $this->callGroq([
+                    'model'       => 'llama-3.3-70b-versatile',
+                    'messages'    => $apiMessages,
+                    'temperature' => 0.5,
+                ]);
+
+                if (!$secondResponse) {
+                    $this->sendFallback($message);
+                    return;
+                }
+
+                $finalText = $secondResponse['choices'][0]['message']['content'] ?? '';
+                $finalText = $this->sanitizeReply($finalText);
+
+                if (empty($finalText)) {
+                    $this->sendFallback($message);
+                    return;
+                }
+
+                $this->sendWhatsAppMessage($message->contact->whatsapp_id, $finalText, $message->contact_id);
+                return;
+            }
+        }
+
+        // ── 7. No tool call — direct conversational reply ─────────────────────
+        $fallbackText = $responseMessage['content'] ?? '';
+        $fallbackText = $this->sanitizeReply($fallbackText);
+
+        if (!empty($fallbackText)) {
+            $this->sendWhatsAppMessage($message->contact->whatsapp_id, $fallbackText, $message->contact_id);
+        } else {
+            $this->sendFallback($message);
         }
     }
 
-    protected function sendWhatsAppMessage($recipientPhone, $textBody, $contactId)
+    // ── Helpers ───────────────────────────────────────────────────────────────
+
+    /**
+     * Centralized Groq HTTP call.
+     * Returns decoded JSON array or null on failure.
+     */
+    private function callGroq(array $body): ?array
     {
-        $phoneId = env('META_WHATSAPP_PHONE_NUMBER_ID');
-        $accessToken = env('META_WHATSAPP_ACCESS_TOKEN');
+        $response = Http::withHeaders([
+            'Authorization' => 'Bearer ' . config('services.groq.api_key'),
+            'Content-Type'  => 'application/json',
+        ])->timeout(30)->post('https://api.groq.com/openai/v1/chat/completions', $body);
+
+        if ($response->failed()) {
+            Log::error('Groq API call failed', [
+                'status'  => $response->status(),
+                'body'    => $response->body(),
+                'model'   => $body['model'],
+                'api_key_set' => !empty(config('services.groq.api_key')), // ✅ check if key loads
+            ]);
+            return null;
+        }
+
+        return $response->json();
+    }
+    /**
+     * Strip any leaked function call syntax from AI reply.
+     * Should never happen with a good prompt, but this is a safety net.
+     */
+    private function sanitizeReply(string $text): string
+    {
+        // Remove <function=...>...</function> leaks
+        $text = preg_replace('/<function[^>]*>.*?<\/function>/s', '', $text);
+        // Remove raw JSON objects that look like tool arguments
+        $text = preg_replace('/\{[\s\S]*?"application_type"[\s\S]*?\}/s', '', $text);
+        // Remove lines that mention internal tool names
+        $text = preg_replace('/search_battery_database[^\n]*/i', '', $text);
+
+        return trim($text);
+    }
+
+    /**
+     * Send a generic Arabic/Darija error fallback to the customer.
+     */
+    private function sendFallback(Message $message): void
+    {
+        Log::warning('Sending fallback message to customer', ['contact_id' => $message->contact_id]);
+
+        $this->sendWhatsAppMessage(
+            $message->contact->whatsapp_id,
+            'Smeh liya sidi, kayn mochkil teknik dghia. 3awd men3d aw tssifet lina lmessage dyalek. 🙏',
+            $message->contact_id
+        );
+    }
+
+    /**
+     * Send a WhatsApp message via Meta Cloud API and save it to DB.
+     */
+    protected function sendWhatsAppMessage(string $recipientPhone, string $textBody, int $contactId): void
+    {
+        if (empty(trim($textBody))) {
+            Log::warning('Attempted to send empty message — aborted', ['contact_id' => $contactId]);
+            return;
+        }
+
+        $accessToken = config('services.meta.access_token');
 
         $response = Http::withToken($accessToken)
-            ->post("https://graph.facebook.com/v20.0/{$phoneId}/messages", [
+            ->post('https://graph.facebook.com/v20.0/' . config('services.meta.phone_number_id') . '/messages', [
+                
                 'messaging_product' => 'whatsapp',
-                'recipient_type' => 'individual',
-                'to' => $recipientPhone,
-                'type' => 'text',
-                'text' => ['preview_url' => false, 'body' => $textBody]
+                'recipient_type'    => 'individual',
+                'to'                => $recipientPhone,
+                'type'              => 'text',
+                'text'              => [
+                    'preview_url' => false,
+                    'body'        => $textBody,
+                ],
             ]);
 
         if ($response->successful()) {
             $metaData = $response->json();
+
             Message::create([
-                'contact_id' => $contactId,
+                'contact_id'      => $contactId,
                 'meta_message_id' => $metaData['messages'][0]['id'] ?? null,
-                'sender_type' => 'bot',
-                'message_type' => 'text',
-                'body' => $textBody,
-                'status' => 'sent',
-                'raw_payload' => $metaData,
+                'sender_type'     => 'bot',
+                'message_type'    => 'text',
+                'body'            => $textBody,
+                'status'          => 'sent',
+                'raw_payload'     => $metaData,
             ]);
+
+            Log::info('WhatsApp message sent', ['contact_id' => $contactId, 'preview' => substr($textBody, 0, 60)]);
         } else {
-            Log::error('Meta Outbound Send Failed: ' . $response->body());
+            Log::error('Meta outbound send failed', [
+                'contact_id' => $contactId,
+                'status'     => $response->status(),
+                'body'       => $response->body(),
+            ]);
         }
     }
 }

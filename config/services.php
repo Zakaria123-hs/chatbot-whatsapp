@@ -28,8 +28,14 @@ return [
         'region' => env('AWS_DEFAULT_REGION', 'us-east-1'),
     ],
 
+    'groq' => [
+        'api_key' => env('GROQ_API_KEY'),
+    ],
+
     'meta' => [
-        'verify_token' => env('META_WHATSAPP_VERIFY_TOKEN'),
+        'verify_token'    => env('META_WHATSAPP_VERIFY_TOKEN'),
+        'access_token'    => env('META_WHATSAPP_ACCESS_TOKEN'),
+        'phone_number_id' => env('META_WHATSAPP_PHONE_NUMBER_ID'),
     ],
 
     'slack' => [
